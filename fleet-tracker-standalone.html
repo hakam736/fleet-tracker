@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>متابعة الأسطول - Fleet Tracker</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #101317; font-family: 'IBM Plex Sans Arabic','Segoe UI',sans-serif; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  @keyframes spin { from { transform: rotate(0deg);} to { transform: rotate(360deg);} }
+  input, select, textarea, button { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+const C = {
+  bg: '#101317', panel: '#1B1F24', panel2: '#232830',
+  diesel: '#F2A93B', adblue: '#4FC3E8', danger: '#E5484D', success: '#3DDC84',
+  text: '#F3F2ED', muted: '#8B939E', border: '#2A3038',
+};
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function fmt(n) { return (Math.round((n || 0) * 10) / 10).toLocaleString('en-US'); }
+
+function polar(cx, cy, r, deg) {
+  const rad = ((deg - 90) * Math.PI) / 180;
+  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+}
+function arcPath(cx, cy, r, startDeg, endDeg) {
+  const s = polar(cx, cy, r, endDeg);
+  const e = polar(cx, cy, r, startDeg);
+  const large = endDeg - startDeg <= 180 ? 0 : 1;
+  return `M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 0 ${e.x} ${e.y}`;
+}
+
+function loadLS(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : fallback;
+  } catch (e) { return fallback; }
+}
+function saveLS(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+}
+
+function fileToCompressedDataUrl(file, maxWidth) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = reject;
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = reject;
+      img.onload = () => {
+        const scale = Math.min(1, maxWidth / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve({ dataUrl: canvas.toDataURL('image/jpeg', 0.6) });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function extractPlateCandidates(text) {
+  const tokens = text.split(/[^A-Za-z0-9]+/).map(t => t.trim()).filter(Boolean);
+  const candidates = tokens.filter(t => /\d/.test(t) && t.length >= 3 && t.length <= 8);
+  return [...new Set(candidates)];
+}
+function digitsOnly(s) { return (s || '').replace(/\D/g, ''); }
+
+function Icon({ children, size }) {
+  return <span style={{ fontSize: size || 14, lineHeight: 1, display: 'inline-block' }}>{children}</span>;
+}
+
+function FleetTracker() {
+  const [vehicles, setVehicles] = useState(() => loadLS('fleet-vehicles', []));
+  const [drivers, setDrivers] = useState(() => loadLS('fleet-drivers', []));
+  const [logs, setLogs] = useState(() => loadLS('fleet-logs', []));
+  const [search, setSearch] = useState('');
+  const [tab, setTab] = useState('overview');
+
+  const [showLogForm, setShowLogForm] = useState(false);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [addTab, setAddTab] = useState('vehicles');
+
+  const [logVehicleId, setLogVehicleId] = useState('');
+  const [logDriverId, setLogDriverId] = useState('');
+  const [newDriverInline, setNewDriverInline] = useState('');
+  const [dieselBefore, setDieselBefore] = useState('');
+  const [dieselAfter, setDieselAfter] = useState('');
+  const [adblueBefore, setAdblueBefore] = useState('');
+  const [adblueAfter, setAdblueAfter] = useState('');
+  const [odo, setOdo] = useState('');
+  const [evidencePhoto, setEvidencePhoto] = useState(null);
+
+  const [showScan, setShowScan] = useState(false);
+  const [scanImage, setScanImage] = useState(null);
+  const [scanStatus, setScanStatus] = useState('idle');
+  const [scanCandidates, setScanCandidates] = useState([]);
+
+  const [bulkVehicleText, setBulkVehicleText] = useState('');
+  const [plate, setPlate] = useState('');
+  const [vtype, setVtype] = useState('');
+  const [bulkDriverText, setBulkDriverText] = useState('');
+  const [driverName, setDriverName] = useState('');
+
+  const [toast, setToast] = useState('');
+
+  useEffect(() => { saveLS('fleet-vehicles', vehicles); }, [vehicles]);
+  useEffect(() => { saveLS('fleet-drivers', drivers); }, [drivers]);
+  useEffect(() => { saveLS('fleet-logs', logs); }, [logs]);
+
+  function notify(msg) { setToast(msg); setTimeout(() => setToast(''), 2200); }
+
+  function addBulkVehicles() {
+    const lines = bulkVehicleText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
+    const newOnes = lines.map(line => {
+      const parts = line.split(/[,\t]/).map(p => p.trim());
+      return { id: uid(), plate: parts[0] || 'بدون رقم', type: parts[1] || '—', lastOdometer: null, avgConsumption: null };
+    });
+    setVehicles(prev => [...prev, ...newOnes]);
+    setBulkVehicleText('');
+    notify(`تمت إضافة ${newOnes.length} مركبة`);
+  }
+  function addSingleVehicle() {
+    if (!plate.trim()) { notify('اكتب رقم اللوحة'); return; }
+    setVehicles(prev => [...prev, { id: uid(), plate: plate.trim(), type: vtype.trim() || '—', lastOdometer: null, avgConsumption: null }]);
+    setPlate(''); setVtype('');
+    notify('تمت إضافة المركبة');
+  }
+  function addBulkDrivers() {
+    const lines = bulkDriverText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return;
+    const newOnes = lines.map(name => ({ id: uid(), name }));
+    setDrivers(prev => [...prev, ...newOnes]);
+    setBulkDriverText('');
+    notify(`تمت إضافة ${newOnes.length} سائق`);
+  }
+  function addSingleDriver(nameRaw, silent) {
+    const name = (nameRaw != null ? nameRaw : driverName).trim();
+    if (!name) { if (!silent) notify('اكتب اسم السائق'); return null; }
+    const d = { id: uid(), name };
+    setDrivers(prev => [...prev, d]);
+    if (!silent) { setDriverName(''); notify('تمت إضافة السائق'); }
+    return d;
+  }
+
+  async function handleScanFile(file) {
+    if (!file) return;
+    setShowScan(true);
+    setScanStatus('loading');
+    setScanCandidates([]);
+    try {
+      const { dataUrl } = await fileToCompressedDataUrl(file, 900);
+      setScanImage(dataUrl);
+      const result = await Tesseract.recognize(dataUrl, 'eng');
+      const rawText = result && result.data ? result.data.text : '';
+      const candidates = extractPlateCandidates(rawText);
+      setScanCandidates(candidates);
+      setScanStatus('done');
+      let matched = null;
+      for (const cand of candidates) {
+        const candDigits = digitsOnly(cand);
+        if (!candDigits) continue;
+        matched = vehicles.find(v => digitsOnly(v.plate) === candDigits);
+        if (matched) break;
+      }
+      if (matched) {
+        setLogVehicleId(matched.id);
+        notify(`تم التعرف على المركبة: ${matched.plate} ✓`);
+        setTimeout(() => setShowScan(false), 900);
+      }
+    } catch (e) {
+      setScanStatus('error');
+    }
+  }
+  function selectCandidateVehicle(cand) {
+    const candDigits = digitsOnly(cand);
+    const matched = vehicles.find(v => digitsOnly(v.plate) === candDigits);
+    if (matched) {
+      setLogVehicleId(matched.id);
+      notify(`تم اختيار المركبة: ${matched.plate}`);
+      setShowScan(false);
+    } else {
+      notify('ما لقيت مركبة بهالرقم — تأكد من إضافتها أول');
+    }
+  }
+  async function handleEvidenceFile(file) {
+    if (!file) return;
+    try {
+      const { dataUrl } = await fileToCompressedDataUrl(file, 500);
+      setEvidencePhoto(dataUrl);
+      notify('تم إرفاق صورة الإثبات');
+    } catch (e) { notify('تعذر معالجة الصورة'); }
+  }
+
+  function submitLog() {
+    if (!logVehicleId) { notify('اختر المركبة'); return; }
+    let driverId = logDriverId;
+    let driverName2 = '';
+    if (!driverId && newDriverInline.trim()) {
+      const d = addSingleDriver(newDriverInline, true);
+      driverId = d.id;
+    }
+    if (!driverId) { notify('اختر السائق أو اكتب اسمه'); return; }
+    const dRec = drivers.find(x => x.id === driverId) || { name: newDriverInline.trim() };
+    driverName2 = dRec.name;
+
+    if (dieselAfter === '') { notify('عبي القراءة بعد التعبئة'); return; }
+    const dBefore = parseFloat(dieselBefore) || 0;
+    const dAfter = parseFloat(dieselAfter) || 0;
+    const aBefore = parseFloat(adblueBefore) || 0;
+    const aAfter = parseFloat(adblueAfter) || 0;
+    const odoVal = odo ? parseFloat(odo) : null;
+    const v = vehicles.find(x => x.id === logVehicleId);
+    if (!v) return;
+
+    const dieselVal = Math.max(dAfter - dBefore, 0);
+    const adblueVal = Math.max(aAfter - aBefore, 0);
+    let flagDiesel = false, flagAdblue = false, dieselPer100 = null, km = null, newAvg = v.avgConsumption;
+
+    if (odoVal != null && v.lastOdometer != null && odoVal > v.lastOdometer) {
+      km = odoVal - v.lastOdometer;
+      dieselPer100 = (dieselVal / km) * 100;
+      if (v.avgConsumption != null) {
+        const ratio = dieselPer100 / v.avgConsumption;
+        if (ratio > 1.3 || ratio < 0.5) flagDiesel = true;
+        newAvg = v.avgConsumption * 0.7 + dieselPer100 * 0.3;
+      } else { newAvg = dieselPer100; }
+    }
+    if (dieselVal > 0 && adblueVal > 0) {
+      const r = adblueVal / dieselVal;
+      if (r < 0.02 || r > 0.08) flagAdblue = true;
+    }
+
+    const entry = {
+      id: uid(), vehicleId: v.id, date: todayStr(),
+      driverId, driverName: driverName2,
+      dieselBefore: dBefore, dieselAfter: dAfter, diesel: dieselVal,
+      adblueBefore: aBefore, adblueAfter: aAfter, adblue: adblueVal,
+      odometer: odoVal, km, dieselPer100, flagDiesel, flagAdblue,
+      photo: evidencePhoto || null,
+    };
+    setLogs(prev => [entry, ...prev]);
+    setVehicles(prev => prev.map(x => x.id === v.id ? { ...x, lastOdometer: odoVal != null ? odoVal : x.lastOdometer, avgConsumption: newAvg } : x));
+
+    setDieselBefore(''); setDieselAfter(''); setAdblueBefore(''); setAdblueAfter(''); setOdo('');
+    setLogVehicleId(''); setLogDriverId(''); setNewDriverInline(''); setEvidencePhoto(null);
+    setShowLogForm(false);
+    notify(flagDiesel || flagAdblue ? '⚠ تم التسجيل — رصدنا استهلاك غير معتاد' : 'تم تسجيل التعبئة');
+  }
+
+  const today = todayStr();
+  const todaysLogs = useMemo(() => logs.filter(l => l.date === today), [logs, today]);
+  const totalDiesel = useMemo(() => todaysLogs.reduce((s, l) => s + l.diesel, 0), [todaysLogs]);
+  const totalAdblue = useMemo(() => todaysLogs.reduce((s, l) => s + l.adblue, 0), [todaysLogs]);
+  const loggedIds = useMemo(() => new Set(todaysLogs.map(l => l.vehicleId)), [todaysLogs]);
+  const anomalies = useMemo(() => todaysLogs.filter(l => l.flagDiesel || l.flagAdblue), [todaysLogs]);
+  const pendingCount = vehicles.length - loggedIds.size;
+
+  const lastDriverByVehicle = useMemo(() => {
+    const map = {};
+    for (const l of logs) { if (!map[l.vehicleId]) map[l.vehicleId] = l.driverName; }
+    return map;
+  }, [logs]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return vehicles.filter(v => !q || v.plate.toLowerCase().includes(q) || (v.type || '').toLowerCase().includes(q) || (lastDriverByVehicle[v.id] || '').toLowerCase().includes(q));
+  }, [vehicles, search, lastDriverByVehicle]);
+
+  function statusOf(v) {
+    const vLogs = todaysLogs.filter(l => l.vehicleId === v.id);
+    if (!vLogs.length) return 'pending';
+    if (vLogs.some(l => l.flagDiesel || l.flagAdblue)) return 'alert';
+    return 'ok';
+  }
+
+  const gaugeVal = Math.min(anomalies.length, 8);
+  const needleDeg = -90 + (gaugeVal / 8) * 180;
+  const needleTip = polar(100, 100, 62, needleDeg);
+
+  const badgeStyle = (kind) => {
+    if (kind === 'ok') return { bg: 'rgba(61,220,132,0.12)', fg: C.success, label: 'طبيعي', icon: '✅' };
+    if (kind === 'alert') return { bg: 'rgba(229,72,77,0.14)', fg: C.danger, label: 'تحقق', icon: '⚠️' };
+    return { bg: 'rgba(139,147,158,0.12)', fg: C.muted, label: 'لم يسجل', icon: '🕐' };
+  };
+
+  return (
+    <div dir="rtl" style={{ background: C.bg, color: C.text, minHeight: '100vh', fontFamily: "'IBM Plex Sans Arabic',sans-serif" }}>
+      <div style={{ padding: '18px 16px 14px', borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ width: 34, height: 34, borderRadius: 9, background: C.panel2, display: 'flex', alignItems: 'center', justifyContent: 'center', border: `1px solid ${C.border}` }}>
+              <Icon size={18}>🚛</Icon>
+            </div>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>متابعة الأسطول</div>
+              <div style={{ fontSize: 11, color: C.muted }} className="mono">{today}</div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 14 }}>
+            <div style={{ textAlign: 'center' }}>
+              <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{vehicles.length}</div>
+              <div style={{ fontSize: 10, color: C.muted }}>مركبة</div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{drivers.length}</div>
+              <div style={{ fontSize: 10, color: C.muted }}>سائق</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <svg viewBox="0 0 200 118" width="220" height="130">
+          <path d={arcPath(100, 100, 80, -90, -30)} stroke={C.success} strokeWidth="14" fill="none" strokeLinecap="round" opacity="0.9" />
+          <path d={arcPath(100, 100, 80, -30, 30)} stroke={C.diesel} strokeWidth="14" fill="none" strokeLinecap="round" opacity="0.9" />
+          <path d={arcPath(100, 100, 80, 30, 90)} stroke={C.danger} strokeWidth="14" fill="none" strokeLinecap="round" opacity="0.9" />
+          <line x1="100" y1="100" x2={needleTip.x} y2={needleTip.y} stroke={C.text} strokeWidth="3.5" strokeLinecap="round" />
+          <circle cx="100" cy="100" r="6.5" fill={C.text} />
+        </svg>
+        <div style={{ marginTop: -12, textAlign: 'center' }}>
+          <div className="mono" style={{ fontSize: 24, fontWeight: 700, color: anomalies.length ? C.danger : C.success }}>{anomalies.length}</div>
+          <div style={{ fontSize: 11, color: C.muted }}>تنبيه استهلاك اليوم</div>
+        </div>
+      </div>
+
+      <div style={{ padding: '0 16px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+        <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon>⛽</Icon><span style={{ fontSize: 11, color: C.muted }}>ديزل اليوم</span></div>
+          <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{fmt(totalDiesel)} <span style={{ fontSize: 11, color: C.muted }}>لتر</span></div>
+        </div>
+        <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon>💧</Icon><span style={{ fontSize: 11, color: C.muted }}>AdBlue اليوم</span></div>
+          <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{fmt(totalAdblue)} <span style={{ fontSize: 11, color: C.muted }}>لتر</span></div>
+        </div>
+        <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon>✅</Icon><span style={{ fontSize: 11, color: C.muted }}>مسجّل اليوم</span></div>
+          <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{loggedIds.size}<span style={{ fontSize: 11, color: C.muted }}> / {vehicles.length}</span></div>
+        </div>
+        <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon>🕐</Icon><span style={{ fontSize: 11, color: C.muted }}>متبقي</span></div>
+          <div className="mono" style={{ fontSize: 18, fontWeight: 700 }}>{Math.max(pendingCount, 0)}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: '14px 16px', display: 'flex', gap: 10 }}>
+        <button onClick={() => setShowLogForm(true)} style={{ flex: 1, background: C.diesel, color: '#1B1400', border: 'none', borderRadius: 10, padding: '11px 10px', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+          <Icon>➕</Icon> تسجيل تعبئة
+        </button>
+        <button onClick={() => setShowAddForm(true)} style={{ flex: 1, background: 'transparent', color: C.text, border: `1px solid ${C.border}`, borderRadius: 10, padding: '11px 10px', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+          <Icon>👥</Icon> إدارة المركبات والسائقين
+        </button>
+      </div>
+
+      <div style={{ padding: '0 16px', display: 'flex', gap: 6, marginBottom: 10 }}>
+        {[{ id: 'overview', label: 'كل المركبات', icon: '🚛' }, { id: 'alerts', label: `تنبيهات (${anomalies.length})`, icon: '⚠️' }].map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{
+            flex: 1, padding: '8px 10px', borderRadius: 9, fontSize: 12.5, fontWeight: 600,
+            background: tab === t.id ? C.panel2 : 'transparent', color: tab === t.id ? C.text : C.muted,
+            border: `1px solid ${tab === t.id ? C.border : 'transparent'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5
+          }}><Icon size={13}>{t.icon}</Icon> {t.label}</button>
+        ))}
+      </div>
+
+      {tab === 'overview' && (
+        <div style={{ padding: '0 16px 20px' }}>
+          <div style={{ position: 'relative', marginBottom: 10 }}>
+            <span style={{ position: 'absolute', right: 12, top: 11, color: C.muted }}>🔍</span>
+            <input value={search} onChange={e => setSearch(e.target.value)} placeholder="ابحث برقم اللوحة، النوع، أو السائق"
+              style={{ width: '100%', background: C.panel, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 36px 10px 12px', color: C.text, fontSize: 13 }} />
+          </div>
+          {vehicles.length === 0 && (
+            <div style={{ textAlign: 'center', padding: '30px 10px', color: C.muted, fontSize: 13 }}>ما فيه مركبات بعد. اضغط "إدارة المركبات والسائقين" ابدأ.</div>
+          )}
+          {filtered.map(v => {
+            const st = statusOf(v);
+            const b = badgeStyle(st);
+            const lastDriver = lastDriverByVehicle[v.id];
+            return (
+              <div key={v.id} style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 12, padding: '11px 12px', marginBottom: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 700 }} className="mono">{v.plate}</div>
+                    {v.type && v.type !== '—' && <span style={{ fontSize: 10, color: C.muted, background: C.panel2, padding: '2px 7px', borderRadius: 6, border: `1px solid ${C.border}` }}>{v.type}</span>}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: C.muted, marginTop: 2 }}>{lastDriver ? `آخر سائق: ${lastDriver}` : 'ما فيه سجل قيادة بعد'}</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: b.bg, color: b.fg, padding: '5px 9px', borderRadius: 20, fontSize: 11, fontWeight: 600 }}>
+                  <Icon size={12}>{b.icon}</Icon> {b.label}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {tab === 'alerts' && (
+        <div style={{ padding: '0 16px 20px' }}>
+          {anomalies.length === 0 && (
+            <div style={{ textAlign: 'center', padding: '30px 10px', color: C.muted, fontSize: 13 }}>
+              <div style={{ fontSize: 26, marginBottom: 8 }}>✅</div>
+              <div>ولا تنبيه اليوم — كل الاستهلاك طبيعي</div>
+            </div>
+          )}
+          {anomalies.map(l => {
+            const v = vehicles.find(x => x.id === l.vehicleId);
+            return (
+              <div key={l.id} style={{ background: 'rgba(229,72,77,0.08)', border: `1px solid rgba(229,72,77,0.35)`, borderRadius: 12, padding: 12, marginBottom: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13 }} className="mono">{v ? v.plate : '—'} {v && v.type && v.type !== '—' ? `· ${v.type}` : ''}</div>
+                  <Icon size={15}>⚠️</Icon>
+                </div>
+                <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 6 }}>السائق: {l.driverName || '—'}</div>
+                {l.flagDiesel && <div style={{ fontSize: 12, color: C.text, marginBottom: 2 }}>⛽ استهلاك ديزل غير معتاد: <span className="mono">{fmt(l.dieselPer100)}</span> ل/١٠٠كم</div>}
+                {l.flagAdblue && <div style={{ fontSize: 12, color: C.text, marginBottom: 4 }}>💧 نسبة AdBlue للديزل غير طبيعية ({fmt((l.adblue / l.diesel) * 100)}%)</div>}
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }} className="mono">ديزل: {fmt(l.dieselBefore)} ← {fmt(l.dieselAfter)} ل &nbsp;|&nbsp; AdBlue: {fmt(l.adblueBefore)} ← {fmt(l.adblueAfter)} ل</div>
+                {l.photo && <img src={l.photo} style={{ width: 60, height: 60, borderRadius: 8, objectFit: 'cover', marginTop: 8, border: `1px solid ${C.border}` }} />}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showLogForm && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-end', zIndex: 50 }} onClick={() => setShowLogForm(false)}>
+          <div onClick={e => e.stopPropagation()} style={{ background: C.panel, width: '100%', borderRadius: '18px 18px 0 0', padding: 18, border: `1px solid ${C.border}`, maxHeight: '90vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>تسجيل تعبئة</div>
+              <button onClick={() => setShowLogForm(false)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 18 }}>✕</button>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
+              <span style={{ fontSize: 12, color: C.muted }}>المركبة</span>
+              <label style={{ position: 'relative', overflow: 'hidden', display: 'flex', alignItems: 'center', gap: 4, background: 'rgba(242,169,59,0.12)', color: C.diesel, border: `1px solid rgba(242,169,59,0.4)`, borderRadius: 8, padding: '4px 9px', fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>
+                📇 اختر صورة اللوحة
+                <input type="file" accept="image/*" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0, cursor: 'pointer' }}
+                  onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) handleScanFile(f); }} />
+              </label>
+            </div>
+            <select value={logVehicleId} onChange={e => setLogVehicleId(e.target.value)}
+              style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 12 }}>
+              <option value="">اختر المركبة</option>
+              {vehicles.map(v => <option key={v.id} value={v.id}>{v.plate}{v.type && v.type !== '—' ? ` — ${v.type}` : ''}</option>)}
+            </select>
+
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 5 }}>السائق اليوم</div>
+            <select value={logDriverId} onChange={e => setLogDriverId(e.target.value)}
+              style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 8 }}>
+              <option value="">اختر السائق</option>
+              {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+            </select>
+            {!logDriverId && (
+              <input value={newDriverInline} onChange={e => setNewDriverInline(e.target.value)} placeholder="أو اكتب اسم سائق جديد هنا"
+                style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 12 }} />
+            )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon size={13}>⛽</Icon><span style={{ fontSize: 12.5, fontWeight: 600 }}>الديزل</span></div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 5 }}>قبل التعبئة (لتر)</div>
+                <input value={dieselBefore} onChange={e => setDieselBefore(e.target.value)} type="number" inputMode="decimal" placeholder="0"
+                  style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 5 }}>بعد التعبئة (لتر)</div>
+                <input value={dieselAfter} onChange={e => setDieselAfter(e.target.value)} type="number" inputMode="decimal" placeholder="0"
+                  style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}><Icon size={13}>💧</Icon><span style={{ fontSize: 12.5, fontWeight: 600 }}>AdBlue</span></div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 5 }}>قبل التعبئة (لتر)</div>
+                <input value={adblueBefore} onChange={e => setAdblueBefore(e.target.value)} type="number" inputMode="decimal" placeholder="0"
+                  style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 5 }}>بعد التعبئة (لتر)</div>
+                <input value={adblueAfter} onChange={e => setAdblueAfter(e.target.value)} type="number" inputMode="decimal" placeholder="0"
+                  style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+              </div>
+            </div>
+
+            {(dieselBefore !== '' || dieselAfter !== '' || adblueBefore !== '' || adblueAfter !== '') && (
+              <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 10 }}>
+                المضاف: <span className="mono" style={{ color: C.diesel }}>{fmt(Math.max((parseFloat(dieselAfter)||0)-(parseFloat(dieselBefore)||0),0))} ل ديزل</span>
+                {'  ·  '}
+                <span className="mono" style={{ color: C.adblue }}>{fmt(Math.max((parseFloat(adblueAfter)||0)-(parseFloat(adblueBefore)||0),0))} ل AdBlue</span>
+              </div>
+            )}
+
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 5 }}>عداد المسافة الحالي (كم) — اختياري لكن يفعّل كشف الهدر</div>
+            <input value={odo} onChange={e => setOdo(e.target.value)} type="number" inputMode="decimal" placeholder="مثال: 154200"
+              style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 12 }} />
+
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>صورة إثبات (اختياري)</div>
+            {evidencePhoto ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                <img src={evidencePhoto} style={{ width: 54, height: 54, borderRadius: 8, objectFit: 'cover', border: `1px solid ${C.border}` }} />
+                <div style={{ fontSize: 11.5, color: C.success, flex: 1 }}>تم إرفاق الصورة ✓</div>
+                <button onClick={() => setEvidencePhoto(null)} style={{ background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 8, padding: '6px 10px', color: C.muted, fontSize: 11 }}>حذف</button>
+              </div>
+            ) : (
+              <label style={{ position: 'relative', overflow: 'hidden', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, background: C.panel2, color: C.text, border: `1px dashed ${C.border}`, borderRadius: 10, padding: '11px', fontSize: 12.5, fontWeight: 600, marginBottom: 16, cursor: 'pointer' }}>
+                📷 التقط أو اختر صورة العداد
+                <input type="file" accept="image/*" capture="environment" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0, cursor: 'pointer' }}
+                  onChange={e => { const f = e.target.files && e.target.files[0]; e.target.value = ''; if (f) handleEvidenceFile(f); }} />
+              </label>
+            )}
+
+            <button onClick={submitLog} style={{ width: '100%', background: C.diesel, color: '#1B1400', border: 'none', borderRadius: 10, padding: '12px', fontSize: 14, fontWeight: 700 }}>حفظ التسجيل</button>
+          </div>
+        </div>
+      )}
+
+      {showAddForm && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-end', zIndex: 50 }} onClick={() => setShowAddForm(false)}>
+          <div onClick={e => e.stopPropagation()} style={{ background: C.panel, width: '100%', borderRadius: '18px 18px 0 0', padding: 18, border: `1px solid ${C.border}`, maxHeight: '85vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>إدارة المركبات والسائقين</div>
+              <button onClick={() => setShowAddForm(false)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 18 }}>✕</button>
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+              <button onClick={() => setAddTab('vehicles')} style={{ flex: 1, padding: '8px 10px', borderRadius: 9, fontSize: 12.5, fontWeight: 600, background: addTab === 'vehicles' ? C.panel2 : 'transparent', color: addTab === 'vehicles' ? C.text : C.muted, border: `1px solid ${addTab === 'vehicles' ? C.border : 'transparent'}` }}>🚛 مركبات</button>
+              <button onClick={() => setAddTab('drivers')} style={{ flex: 1, padding: '8px 10px', borderRadius: 9, fontSize: 12.5, fontWeight: 600, background: addTab === 'drivers' ? C.panel2 : 'transparent', color: addTab === 'drivers' ? C.text : C.muted, border: `1px solid ${addTab === 'drivers' ? C.border : 'transparent'}` }}>➕ سائقين</button>
+            </div>
+
+            {addTab === 'vehicles' && (
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 8 }}>إضافة سريعة (وحدة)</div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+                  <input value={plate} onChange={e => setPlate(e.target.value)} placeholder="رقم اللوحة" style={{ flex: 1, background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+                  <input value={vtype} onChange={e => setVtype(e.target.value)} placeholder="نوع المركبة" style={{ flex: 1, background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13 }} />
+                </div>
+                <button onClick={addSingleVehicle} style={{ width: '100%', background: C.panel2, color: C.text, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px', fontSize: 13, fontWeight: 600, marginBottom: 18 }}>+ إضافة مركبة وحدة</button>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>إضافة جماعية (لصق قائمة)</div>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>كل سطر: رقم اللوحة, نوع المركبة — مثال: 45872,شاحنة</div>
+                <textarea value={bulkVehicleText} onChange={e => setBulkVehicleText(e.target.value)} rows={6} placeholder={"45872,شاحنة\n33190,بيك أب"} style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 12 }} />
+                <button onClick={addBulkVehicles} style={{ width: '100%', background: C.diesel, color: '#1B1400', border: 'none', borderRadius: 10, padding: '12px', fontSize: 14, fontWeight: 700 }}>إضافة القائمة كاملة</button>
+              </div>
+            )}
+
+            {addTab === 'drivers' && (
+              <div>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 8 }}>إضافة سريعة (وحدة)</div>
+                <input value={driverName} onChange={e => setDriverName(e.target.value)} placeholder="اسم السائق" style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 8 }} />
+                <button onClick={() => addSingleDriver()} style={{ width: '100%', background: C.panel2, color: C.text, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px', fontSize: 13, fontWeight: 600, marginBottom: 18 }}>+ إضافة سائق وحدة</button>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>إضافة جماعية (لصق قائمة)</div>
+                <textarea value={bulkDriverText} onChange={e => setBulkDriverText(e.target.value)} rows={6} placeholder={"أحمد سالم\nمحمد علي"} style={{ width: '100%', background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 10, padding: '10px 12px', color: C.text, fontSize: 13, marginBottom: 12 }} />
+                <button onClick={addBulkDrivers} style={{ width: '100%', background: C.diesel, color: '#1B1400', border: 'none', borderRadius: 10, padding: '12px', fontSize: 14, fontWeight: 700 }}>إضافة القائمة كاملة</button>
+                {drivers.length > 0 && (
+                  <div style={{ marginTop: 18 }}>
+                    <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>السائقين المسجّلين ({drivers.length})</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {drivers.map(d => <span key={d.id} style={{ fontSize: 11.5, background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 20, padding: '5px 12px' }}>{d.name}</span>)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showScan && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 70, padding: 20 }} onClick={() => setShowScan(false)}>
+          <div onClick={e => e.stopPropagation()} style={{ background: C.panel, width: '100%', maxWidth: 340, borderRadius: 16, padding: 18, border: `1px solid ${C.border}` }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 14, display: 'flex', alignItems: 'center', gap: 6 }}>📇 مسح اللوحة</div>
+              <button onClick={() => setShowScan(false)} style={{ background: 'none', border: 'none', color: C.muted, fontSize: 18 }}>✕</button>
+            </div>
+            {scanImage && <img src={scanImage} style={{ width: '100%', borderRadius: 10, marginBottom: 12, border: `1px solid ${C.border}` }} />}
+            {scanStatus === 'loading' && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: '14px 0', color: C.muted, fontSize: 12.5 }}>
+                <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>⏳</span> جاري قراءة الرقم...
+              </div>
+            )}
+            {scanStatus === 'error' && <div style={{ textAlign: 'center', padding: '10px 0', color: C.danger, fontSize: 12.5 }}>ما قدرنا نقرأ الصورة. جرب صورة أوضح.</div>}
+            {scanStatus === 'done' && (
+              <div>
+                {scanCandidates.length === 0 && <div style={{ textAlign: 'center', padding: '10px 0', color: C.muted, fontSize: 12.5 }}>ما لقينا أرقام واضحة. جرب صورة أقرب وأوضح.</div>}
+                {scanCandidates.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 11.5, color: C.muted, marginBottom: 8 }}>اختر الرقم الصحيح:</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {scanCandidates.map(c => (
+                        <button key={c} onClick={() => selectCandidateVehicle(c)} style={{ background: C.panel2, border: `1px solid ${C.border}`, borderRadius: 8, padding: '7px 12px', color: C.text, fontSize: 13 }} className="mono">{c}</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div style={{ position: 'fixed', bottom: 18, left: '50%', transform: 'translateX(-50%)', background: C.panel2, border: `1px solid ${C.border}`, color: C.text, padding: '10px 18px', borderRadius: 24, fontSize: 12.5, zIndex: 60, boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>{toast}</div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<FleetTracker />);
+</script>
+</body>
+</html>
